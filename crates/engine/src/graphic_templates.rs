@@ -4,9 +4,8 @@
 //! - **Templates** (`graphics.template.*`): FilmCraft's own `.fcgt` format
 //!   ([`filmcraft_project::gtemplate`]). Built-in templates are original designs in code; user
 //!   templates live in `<data dir>/Graphics Templates/*.fcgt`. Export As Motion Graphics Template
-//!   makes one from a graphic clip with chosen editable properties; Install copies a `.fcgt` into
-//!   the user folder (Adobe `.mogrt` files are refused without being opened); Apply places a new
-//!   graphic clip; `graphics.template.set` edits a placed template's properties.
+//!   makes one from a graphic clip with chosen editable properties; Install copies `.fcgt` files or
+//!   converts supported `.mogrt` source data into the user folder; Apply places a new graphic clip.
 //! - **Responsive design:** `graphics.setRoll` (roll / crawl options), `graphics.setResponsiveTime`
 //!   (protected intro / outro), `graphics.pin` (pin a layer's edges to another layer or the frame).
 //! - **Per-character styles:** `graphics.setCharStyle` styles a range of characters.
@@ -96,7 +95,7 @@ fn is_mogrt(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".mogrt")
 }
 
-const MOGRT: &str = "FilmCraft does not open Adobe .mogrt files (or other applications' template packages); it reads only its own .fcgt graphics templates";
+const MOGRT: &str = "use graphics.template.inspectMogrt to review compatibility, then graphics.template.install to convert supported MOGRT source data";
 
 /// Find a template by id, name (case-insensitive) or `.fcgt` path.
 pub fn find_template(s: &Session, key: &str) -> Result<LibraryEntry> {
@@ -132,7 +131,10 @@ fn register_fonts(t: &GraphicsTemplate) -> usize {
 }
 
 fn control_json(c: &TemplateControl) -> Value {
-    json!({"id": c.id, "name": c.name, "kind": c.kind.name(), "layer": c.layer, "param": c.param, "min": c.min, "max": c.max})
+    json!({
+        "id": c.id, "name": c.name, "kind": c.kind.name(), "layer": c.layer, "param": c.param,
+        "min": c.min, "max": c.max, "choices": c.choices,
+    })
 }
 
 fn entry_json(e: &LibraryEntry) -> Value {
@@ -218,6 +220,13 @@ fn list_templates(s: &mut Session, p: &Value) -> Result<Value> {
 /// Value of a control on a placed graphic, as JSON.
 fn control_value(it: &TrackItem, c: &TemplateControl, mt: Tick) -> Value {
     let Some(e) = it.effects.iter().find(|e| graphic::is_layer(e) && layer_uid(e) == c.layer) else { return Value::Null };
+    if c.kind == ControlKind::Choice {
+        let selected = c.choice_layers.iter().position(|group| {
+            !group.is_empty()
+                && group.iter().all(|uid| it.effects.iter().any(|effect| graphic::is_layer(effect) && layer_uid(effect) == *uid && effect.enabled))
+        });
+        return selected.and_then(|index| c.choices.get(index)).map_or(Value::Null, |choice| json!(choice));
+    }
     if c.param == "enabled" {
         return json!(e.enabled);
     }
@@ -268,6 +277,28 @@ fn set_controls(s: &mut Session, clip: ClipId, values: &serde_json::Map<String, 
             .find(|c| c.id == *k)
             .or_else(|| link.controls.iter().find(|c| c.name.eq_ignore_ascii_case(k)))
             .ok_or_else(|| bad("graphics.template.set", format!("the template has no property `{k}`")))?;
+        if c.kind == ControlKind::Choice {
+            let selected = match v {
+                Value::String(name) => c.choices.iter().position(|choice| choice == name),
+                Value::Number(number) => number.as_u64().and_then(|index| usize::try_from(index).ok()).filter(|index| *index < c.choices.len()),
+                _ => None,
+            }
+            .ok_or_else(|| bad("graphics.template.set", format!("`{}` must be one of the available choices", c.name)))?;
+            for (index, group) in c.choice_layers.iter().enumerate() {
+                for uid in group {
+                    let ei = it
+                        .effects
+                        .iter()
+                        .position(|effect| graphic::is_layer(effect) && layer_uid(effect) == *uid)
+                        .ok_or_else(|| bad("graphics.template.set", format!("choice `{}` references a missing layer", c.name)))?;
+                    let mut props = serde_json::Map::new();
+                    props.insert("enabled".into(), json!(index == selected));
+                    set_props(s, clip, ei, &props, tl, "Change Template Property", None)?;
+                }
+            }
+            n += 1;
+            continue;
+        }
         let ei = it
             .effects
             .iter()
@@ -377,6 +408,8 @@ fn export_controls(it: &TrackItem, layers: &[EffectInstance], p: &Value) -> Resu
                     param: "text".into(),
                     min: None,
                     max: None,
+                    choices: Vec::new(),
+                    choice_layers: Vec::new(),
                 });
             }
         }
@@ -416,7 +449,7 @@ fn export_controls(it: &TrackItem, layers: &[EffectInstance], p: &Value) -> Resu
                 max = max.or(Some(soft_max));
             }
         }
-        out.push(TemplateControl { id, name, kind, layer: layer_uid(layer), param, min, max });
+        out.push(TemplateControl { id, name, kind, layer: layer_uid(layer), param, min, max, choices: Vec::new(), choice_layers: Vec::new() });
     }
     Ok(out)
 }
@@ -534,21 +567,451 @@ fn export_template(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn install_template(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("graphics.template.install", "need `path`"))?.to_string();
-    if is_mogrt(&path) {
-        return Err(EngineError::Other(MOGRT.into()));
-    }
     let b = s.services.read_file(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    let mut t = GraphicsTemplate::from_bytes(&b).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let (mut t, compatibility) = if is_mogrt(&path) {
+        let converted = filmcraft_project::mogrt::convert(&b).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        let (mut template, mut report) = (converted.template, converted.report);
+        attach_selected_butterfly(&b, &mut template, &mut report);
+        (template, Some(report))
+    } else {
+        (GraphicsTemplate::from_bytes(&b).map_err(|e| EngineError::Other(format!("{path}: {e}")))?, None)
+    };
     if !t.id.starts_with("user:") {
         t.id = format!("user:{}", gtemplate::slug(&t.name));
     }
     let dir = user_templates_dir(s).ok_or_else(|| bad("graphics.template.install", "no data directory for templates"))?;
-    let _ = std::fs::create_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
     let dest = dir.join(format!("{}.{TEMPLATE_EXTENSION}", gtemplate::slug(&t.name))).to_string_lossy().to_string();
     s.services.write_file(&dest, t.to_json().as_bytes()).map_err(|e| EngineError::Other(format!("{dest}: {e}")))?;
     let fonts = register_fonts(&t);
     s.toast(format!("Installed graphics template \"{}\"", t.name));
-    Ok(json!({"id": t.id, "name": t.name, "path": dest, "fontsRegistered": fonts}))
+    let compatibility =
+        compatibility.map(serde_json::to_value).transpose().map_err(|e| EngineError::Other(format!("could not serialize MOGRT compatibility report: {e}")))?;
+    Ok(json!({"id": t.id, "name": t.name, "path": dest, "fontsRegistered": fonts, "compatibility": compatibility}))
+}
+
+fn inspect_mogrt(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = str_p(p, "path").ok_or_else(|| bad("graphics.template.inspectMogrt", "need `path`"))?.to_string();
+    if !is_mogrt(&path) {
+        return Err(bad("graphics.template.inspectMogrt", "path must have a .mogrt extension"));
+    }
+    let bytes = s.services.read_file(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let report = filmcraft_project::mogrt::inspect(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    serde_json::to_value(report).map_err(|e| EngineError::Other(format!("could not serialize MOGRT compatibility report: {e}")))
+}
+
+fn convert_mogrt(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = str_p(p, "path").ok_or_else(|| bad("graphics.template.convertMogrt", "need `path`"))?.to_string();
+    let output_path = str_p(p, "outputPath").ok_or_else(|| bad("graphics.template.convertMogrt", "need `outputPath`"))?.to_string();
+    if !is_mogrt(&path) {
+        return Err(bad("graphics.template.convertMogrt", "path must have a .mogrt extension"));
+    }
+    if !output_path.to_ascii_lowercase().ends_with(".fcgt") {
+        return Err(bad("graphics.template.convertMogrt", "outputPath must have a .fcgt extension"));
+    }
+    if path == output_path {
+        return Err(bad("graphics.template.convertMogrt", "outputPath must differ from the input path"));
+    }
+    let bytes = s.services.read_file(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut converted = filmcraft_project::mogrt::convert(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    attach_selected_butterfly(&bytes, &mut converted.template, &mut converted.report);
+    let serialized = converted.template.to_json();
+    filmcraft_project::gtemplate::GraphicsTemplate::from_bytes(serialized.as_bytes())
+        .map_err(|e| EngineError::Other(format!("generated FCGT is invalid: {e}")))?;
+    s.services.write_file(&output_path, serialized.as_bytes()).map_err(|e| EngineError::Other(format!("{output_path}: {e}")))?;
+    let report = serde_json::to_value(&converted.report).map_err(|e| EngineError::Other(format!("could not serialize MOGRT compatibility report: {e}")))?;
+    Ok(
+        json!({"path": output_path, "format": filmcraft_project::gtemplate::TEMPLATE_FORMAT, "partial": converted.report.partial, "layers": converted.template.layers.len(), "report": report}),
+    )
+}
+
+const MAX_IMPORTED_AI_NODES: usize = 8192;
+const MAX_IMPORTED_AI_PATHS: usize = 4096;
+const MAX_IMPORTED_AI_ANCHORS: usize = 8192;
+const MAX_IMPORTED_AI_TOTAL_POINTS: usize = 262_144;
+
+#[derive(Clone)]
+struct ImportedAiShape {
+    name: String,
+    points: Vec<[f64; 2]>,
+    fill: [f32; 4],
+    opacity: f64,
+}
+
+fn attach_selected_butterfly(bytes: &[u8], template: &mut GraphicsTemplate, report: &mut filmcraft_project::mogrt::CompatibilityReport) {
+    let Some(selector) = report.controls.iter().find(|control| control.name == "Butterfly/Pencil Selector") else {
+        return;
+    };
+    let Some(selected_index) = selector.value.as_u64().and_then(|value| value.checked_sub(1)).and_then(|value| usize::try_from(value).ok()) else {
+        report.unsupported_features.push("the butterfly selector has an invalid selected value".into());
+        return;
+    };
+    let choices: Vec<String> = selector.choices.iter().filter(|choice| choice.starts_with("Butterfly ")).cloned().collect();
+    if choices.len() != selector.choices.len() || choices.is_empty() || selected_index >= choices.len() {
+        report.unsupported_features.push("the butterfly selector choices do not map to standalone butterfly Illustrator assets".into());
+        return;
+    }
+    let assets = match filmcraft_project::mogrt::illustrator_assets(bytes) {
+        Ok(assets) => assets,
+        Err(error) => {
+            report.unsupported_features.push(format!("Illustrator vector assets could not be extracted: {error}"));
+            return;
+        }
+    };
+    let mut staged_template = template.clone();
+    let mut staged_report = report.clone();
+    let mut choice_layers = Vec::with_capacity(choices.len());
+    let mut conversion_failed = false;
+    for (index, choice) in choices.iter().enumerate() {
+        let first_new_layer = staged_template.layers.len();
+        attach_butterfly_variant(&assets, choice, &mut staged_template, &mut staged_report);
+        let added = staged_template.layers.len().saturating_sub(first_new_layer);
+        if added == 0 {
+            staged_report.unsupported_features.push(format!("butterfly variant `{choice}` could not be converted"));
+            conversion_failed = true;
+            continue;
+        }
+        let mut uids = Vec::with_capacity(added);
+        for layer in staged_template.layers.iter_mut().take(added) {
+            layer.enabled = index == selected_index;
+            uids.push(filmcraft_project::gtemplate::layer_uid(layer));
+        }
+        choice_layers.push(uids);
+    }
+    if conversion_failed || choice_layers.len() != choices.len() {
+        for feature in staged_report.unsupported_features {
+            if !report.unsupported_features.contains(&feature) {
+                report.unsupported_features.push(feature);
+            }
+        }
+        report.unsupported_features.push("the butterfly selector was not added because all six variants could not be converted".into());
+        report.unsupported_features.sort();
+        report.unsupported_features.dedup();
+        return;
+    }
+    let first_uid = choice_layers.first().and_then(|group| group.first()).copied().unwrap_or(0);
+    staged_template.controls.push(TemplateControl {
+        id: "mogrt-butterfly-selector".into(),
+        name: "Butterfly/Pencil Selector".into(),
+        kind: ControlKind::Choice,
+        layer: first_uid,
+        param: "enabled".into(),
+        min: None,
+        max: None,
+        choices: choices.clone(),
+        choice_layers,
+    });
+    let butterfly_asset_count = assets
+        .iter()
+        .filter(|(name, _)| {
+            name.to_ascii_lowercase().rsplit('/').next().is_some_and(|filename| filename.starts_with("butterfly-only-") && filename.ends_with(".ai"))
+        })
+        .count();
+    staged_report.supported_features.push(format!("{butterfly_asset_count} butterfly Illustrator assets extracted from the nested project archive"));
+    staged_report.supported_features.push(format!("all {} butterfly color variants imported and linked to a six-way selector", choices.len()));
+    staged_report.unsupported_features.retain(|feature| {
+        !feature.starts_with("butterfly Illustrator/PDF footage assets are present but omitted")
+            && !feature.starts_with("choice control `Butterfly/Pencil Selector`")
+            && !feature.starts_with("the MOGRT dropdown's choice list")
+            && !feature.starts_with("only the currently selected butterfly variant")
+    });
+    staged_report
+        .unsupported_features
+        .push("butterfly contours were placed using their bounds in the bundled preview, not decoded After Effects transforms".into());
+    staged_report.converted_layer_count = Some(staged_template.layers.len());
+    staged_report.supported_features.sort();
+    staged_report.supported_features.dedup();
+    staged_report.unsupported_features.sort();
+    staged_report.unsupported_features.dedup();
+    *template = staged_template;
+    *report = staged_report;
+}
+
+fn attach_butterfly_variant(
+    assets: &[(String, Vec<u8>)],
+    selected_name: &str,
+    template: &mut GraphicsTemplate,
+    report: &mut filmcraft_project::mogrt::CompatibilityReport,
+) {
+    let token = selected_name.strip_prefix("Butterfly ").map(str::to_ascii_lowercase);
+    let Some(token) = token else {
+        report.unsupported_features.push(format!("selected artwork `{selected_name}` has no matching imported vector asset"));
+        report.unsupported_features.sort();
+        report.unsupported_features.dedup();
+        return;
+    };
+    let suffix = format!("butterfly-only-{token}.ai");
+    let Some((asset_name, asset_bytes)) = assets.iter().find(|(name, _)| name.to_ascii_lowercase().ends_with(&suffix)) else {
+        report.unsupported_features.push(format!("no standalone vector asset matches selected artwork `{selected_name}`"));
+        report.unsupported_features.sort();
+        report.unsupported_features.dedup();
+        return;
+    };
+    let imported = match vectorcraft_pdf::import(asset_bytes) {
+        Ok(document) => document,
+        Err(error) => {
+            report.unsupported_features.push(format!("selected butterfly asset `{asset_name}` could not be read as PDF: {error}"));
+            report.unsupported_features.sort();
+            report.unsupported_features.dedup();
+            return;
+        }
+    };
+    let value = match serde_json::to_value(imported) {
+        Ok(value) => value,
+        Err(error) => {
+            report.unsupported_features.push(format!("selected butterfly asset `{asset_name}` could not be inspected: {error}"));
+            report.unsupported_features.sort();
+            report.unsupported_features.dedup();
+            return;
+        }
+    };
+    let mut shapes = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut total_points = 0usize;
+    let mut stack: Vec<(&Value, usize)> = value.get("layers").and_then(Value::as_array).into_iter().flatten().rev().map(|node| (node, 0)).collect();
+    let mut visited = 0usize;
+    'nodes: while let Some((node, depth)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_IMPORTED_AI_NODES || depth > 128 {
+            unsupported.push("selected butterfly vector exceeds the supported node/depth limits".to_string());
+            break;
+        }
+        let kind = node.get("kind").unwrap_or(&Value::Null);
+        let kind_name = kind.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind_name {
+            "layer" | "group" => {
+                if kind.get("clip").and_then(Value::as_bool).unwrap_or(false) {
+                    unsupported.push("clipped Illustrator groups in the selected butterfly were omitted".into());
+                    continue;
+                }
+                if let Some(children) = kind.get("children").and_then(Value::as_array) {
+                    stack.extend(children.iter().rev().map(|child| (child, depth + 1)));
+                }
+            }
+            "path" => {
+                let path = kind.get("path").unwrap_or(&Value::Null);
+                let Some(subpaths) = path.get("subpaths").and_then(Value::as_array) else {
+                    unsupported.push("a butterfly path had no readable subpaths".into());
+                    continue;
+                };
+                let Some(fill) = imported_solid_fill(node, &mut unsupported) else { continue };
+                if subpaths.len() > 1 {
+                    unsupported.push("compound butterfly contours were imported as separate filled polygons; interior holes may be filled".into());
+                }
+                let path_name = node.get("name").and_then(Value::as_str).unwrap_or("Butterfly path");
+                for (subpath_index, subpath) in subpaths.iter().enumerate() {
+                    // PDF fill operations implicitly close open subpaths.
+                    let Some(anchors) = subpath.get("anchors").and_then(Value::as_array) else {
+                        unsupported.push("a butterfly path had no readable anchors".into());
+                        continue;
+                    };
+                    if anchors.len() < 3 || anchors.len() > MAX_IMPORTED_AI_ANCHORS {
+                        unsupported.push("a butterfly path had an unsupported anchor count".into());
+                        continue;
+                    }
+                    let mut points = Vec::new();
+                    let mut valid = true;
+                    for index in 0..anchors.len() {
+                        let Some(start) = anchors.get(index).and_then(|anchor| point_field(anchor, "p")) else {
+                            valid = false;
+                            break;
+                        };
+                        let Some(next) = anchors.get((index + 1) % anchors.len()) else {
+                            valid = false;
+                            break;
+                        };
+                        let Some(end) = point_field(next, "p") else {
+                            valid = false;
+                            break;
+                        };
+                        let out = point_field(anchors.get(index).unwrap_or(&Value::Null), "out").unwrap_or(start);
+                        let input = point_field(next, "in").unwrap_or(end);
+                        if out == start && input == end {
+                            points.push(start);
+                            continue;
+                        }
+                        for step in 0..8 {
+                            let t = step as f64 / 8.0;
+                            points.push(cubic(start, out, input, end, t));
+                            if points.len() > MAX_IMPORTED_AI_ANCHORS.saturating_mul(8) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if !valid {
+                            break;
+                        }
+                    }
+                    if !valid {
+                        unsupported.push("a butterfly path had malformed or excessive geometry".into());
+                        continue;
+                    }
+                    if points.len() < 3 {
+                        unsupported.push("a butterfly path had malformed or excessive geometry".into());
+                        continue;
+                    }
+                    if shapes.len() >= MAX_IMPORTED_AI_PATHS {
+                        unsupported.push("the selected butterfly has more paths than FilmCraft's import limit".into());
+                        break 'nodes;
+                    }
+                    let Some(next_total_points) = total_points.checked_add(points.len()).filter(|count| *count <= MAX_IMPORTED_AI_TOTAL_POINTS) else {
+                        unsupported.push("the selected butterfly exceeds FilmCraft's total vector-point limit".into());
+                        break 'nodes;
+                    };
+                    total_points = next_total_points;
+                    let opacity = node.get("opacity").and_then(Value::as_f64).filter(|value| value.is_finite() && (0.0..=1.0).contains(value)).unwrap_or(1.0);
+                    let name = if subpaths.len() == 1 { path_name.to_string() } else { format!("{path_name} contour {}", subpath_index + 1) };
+                    shapes.push(ImportedAiShape { name, points, fill, opacity });
+                }
+            }
+            "compound" | "image" | "text" => unsupported.push(format!("selected butterfly {kind_name} objects are unsupported by FilmCraft graphic layers")),
+            "" => unsupported.push("an imported butterfly node had no recognizable kind".into()),
+            other => unsupported.push(format!("selected butterfly object kind `{other}` was omitted")),
+        }
+    }
+    let Some([source_x0, source_y0, source_x1, source_y1]) = imported_shape_bounds(&shapes) else {
+        report.unsupported_features.push("the selected butterfly AI asset contained no supported solid-filled contours".into());
+        report.unsupported_features.extend(unsupported);
+        report.unsupported_features.sort();
+        report.unsupported_features.dedup();
+        return;
+    };
+    let source_width = source_x1 - source_x0;
+    let source_height = source_y1 - source_y0;
+    if !source_width.is_finite() || !source_height.is_finite() || source_width <= 0.0 || source_height <= 0.0 {
+        report.unsupported_features.push("selected butterfly vector has invalid bounds".into());
+        report.unsupported_features.extend(unsupported);
+        report.unsupported_features.sort();
+        report.unsupported_features.dedup();
+        return;
+    }
+    let target: [f64; 4] = [126.0, 153.0, 173.0, 216.0];
+    let (canvas_width, canvas_height) = (template.canvas[0] as f64 / 640.0, template.canvas[1] as f64 / 360.0);
+    let target_width = target[2] - target[0];
+    let target_height = target[3] - target[1];
+    let offset_x = target[0] * canvas_width;
+    let offset_y = target[1] * canvas_height;
+    let first_uid = template.layers.iter().map(filmcraft_project::gtemplate::layer_uid).max().unwrap_or(0).saturating_add(1);
+    let mut vector_layers = Vec::with_capacity(shapes.len());
+    for (index, shape) in shapes.iter().enumerate() {
+        let mapped = shape
+            .points
+            .iter()
+            .map(|point| {
+                [
+                    offset_x + (point[1] - source_y0) / source_height * target_width * canvas_width,
+                    offset_y + (source_x1 - point[0]) / source_width * target_height * canvas_height,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let Some(bounds) = point_bounds(&mapped) else { continue };
+        let center = Vec2::new((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0);
+        let local_points = mapped.iter().map(|point| [(point[0] - center.x) as f32, (point[1] - center.y) as f32]).collect();
+        let mut layer = graphic::new_shape_layer(3, center, Vec2::new(bounds[2] - bounds[0], bounds[3] - bounds[1]), local_points);
+        let uid = first_uid.saturating_add(index as u64);
+        let name = format!("{selected_name} - {}", shape.name);
+        layer.params.insert("name".into(), filmcraft_project::Param::new(ParamValue::Text(name)));
+        layer.params.insert("fill_color".into(), filmcraft_project::Param::new(ParamValue::Color(shape.fill)));
+        layer.params.insert("opacity".into(), filmcraft_project::Param::new(ParamValue::Float(shape.opacity * 100.0)));
+        layer.layer = Some(Box::new(LayerExtra { uid, ..Default::default() }));
+        vector_layers.push(layer);
+    }
+    let added = vector_layers.len();
+    template.layers.splice(0..0, vector_layers);
+    report.converted_layer_count = Some(template.layers.len());
+    if added > 0 {
+        report.supported_features.push(format!("selected `{selected_name}` imported as vector contours"));
+        report.supported_features.push(format!("{added} selected butterfly vector contours imported from `{asset_name}` via VectorCraft's PDF importer"));
+        report.unsupported_features.push(
+            "butterfly contours were rotated and scaled to the preview silhouette box; original After Effects transforms and layer placement were unavailable"
+                .into(),
+        );
+        report
+            .unsupported_features
+            .push("only the currently selected butterfly variant was imported; the six-way selector cannot be represented as a dropdown in FCGT".into());
+        report.unsupported_features.retain(|feature| !feature.starts_with("butterfly Illustrator/PDF footage assets are present but omitted"));
+    }
+    report.unsupported_features.extend(unsupported);
+    report.supported_features.sort();
+    report.supported_features.dedup();
+    report.unsupported_features.sort();
+    report.unsupported_features.dedup();
+}
+
+fn imported_solid_fill(node: &Value, unsupported: &mut Vec<String>) -> Option<[f32; 4]> {
+    let items = node.get("appearance")?.get("items")?.as_array()?;
+    let fills = items.iter().filter(|item| item.get("kind").and_then(Value::as_str) == Some("fill")).collect::<Vec<_>>();
+    if fills.len() != 1 {
+        unsupported.push("butterfly paths with multiple or missing fills were omitted".into());
+        return None;
+    }
+    let fill = fills.first()?;
+    let paint = fill.get("paint")?;
+    if paint.get("type").and_then(Value::as_str) != Some("solid") {
+        unsupported.push("gradient/pattern butterfly fills were omitted; only solid RGB fills are mapped".into());
+        return None;
+    }
+    let color = paint.get("color")?;
+    if color.get("model").and_then(Value::as_str) != Some("rgb") {
+        unsupported.push("non-RGB butterfly fills were omitted".into());
+        return None;
+    }
+    let mut rgba = [0.0f32; 4];
+    for (index, key) in ["r", "g", "b"].iter().enumerate() {
+        let Some(channel) = color.get(*key).and_then(Value::as_f64).filter(|channel| channel.is_finite() && (0.0..=1.0).contains(channel)) else {
+            unsupported.push("malformed butterfly RGB fill was omitted".into());
+            return None;
+        };
+        rgba[index] = channel as f32;
+    }
+    rgba[3] = fill.get("opacity").and_then(Value::as_f64).filter(|opacity| opacity.is_finite() && (0.0..=1.0).contains(opacity)).unwrap_or(1.0) as f32;
+    Some(rgba)
+}
+
+fn point_field(node: &Value, field: &str) -> Option<[f64; 2]> {
+    let point = node.get(field)?.as_array()?;
+    let x = point.get(0)?.as_f64()?;
+    let y = point.get(1)?.as_f64()?;
+    (x.is_finite() && y.is_finite() && x.abs() <= 4.0e6 && y.abs() <= 4.0e6).then_some([x, y])
+}
+
+fn cubic(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], t: f64) -> [f64; 2] {
+    let u = 1.0 - t;
+    let a = u * u * u;
+    let b = 3.0 * u * u * t;
+    let c = 3.0 * u * t * t;
+    let d = t * t * t;
+    [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]]
+}
+
+fn point_bounds(points: &[[f64; 2]]) -> Option<[f64; 4]> {
+    let first = points.first()?;
+    let mut bounds = [first[0], first[1], first[0], first[1]];
+    for point in points.iter().skip(1) {
+        if point.iter().any(|value| !value.is_finite() || value.abs() > 4.0e6) {
+            return None;
+        }
+        bounds[0] = bounds[0].min(point[0]);
+        bounds[1] = bounds[1].min(point[1]);
+        bounds[2] = bounds[2].max(point[0]);
+        bounds[3] = bounds[3].max(point[1]);
+    }
+    Some(bounds)
+}
+
+fn imported_shape_bounds(shapes: &[ImportedAiShape]) -> Option<[f64; 4]> {
+    let first = shapes.first()?.points.first()?;
+    let mut bounds = [first[0], first[1], first[0], first[1]];
+    for point in shapes.iter().flat_map(|shape| &shape.points) {
+        if point.iter().any(|value| !value.is_finite() || value.abs() > 4.0e6) {
+            return None;
+        }
+        bounds[0] = bounds[0].min(point[0]);
+        bounds[1] = bounds[1].min(point[1]);
+        bounds[2] = bounds[2].max(point[0]);
+        bounds[3] = bounds[3].max(point[1]);
+    }
+    Some(bounds)
 }
 
 fn remove_template(s: &mut Session, p: &Value) -> Result<Value> {
@@ -696,7 +1159,6 @@ fn pin_layer(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let edges = edges_p(p);
     let mt = mt_at_playhead(s, &it);
-    // pins are measured at rest (without the roll / crawl offset)
     let mut rest = it.clone();
     if let Some(m) = rest.graphic.as_mut() {
         m.roll.mode = RollMode::Off;
@@ -709,7 +1171,7 @@ fn pin_layer(s: &mut Session, p: &Value) -> Result<Value> {
         Some(None) => Some((PinTarget::Frame, [0.0, 0.0, size.0 as f64, size.1 as f64], None)),
         Some(Some(t)) => Some((PinTarget::Layer(0), bounds_of(idx[t]).ok_or_else(|| bad("graphics.pin", "bad target"))?, Some(idx[t]))),
     };
-    let r = s.edit_sequence("Responsive Design - Position", move |q, _, _| {
+    s.edit_sequence("Responsive Design - Position", move |q, _, _| {
         let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
         let li = layer_indices(&it.effects);
         let mut layers: Vec<EffectInstance> = li.iter().map(|&i| it.effects[i].clone()).collect();
@@ -727,8 +1189,7 @@ fn pin_layer(s: &mut Session, p: &Value) -> Result<Value> {
         it.effects[ei].layer.get_or_insert_with(Default::default).pin = new_pin;
         let uid = it.effects[ei].layer.as_ref().map_or(0, |x| x.uid);
         Ok(json!({"clip": clip.0, "layer": l, "uid": uid, "pin": it.effects[ei].layer.as_ref().and_then(|x| x.pin.as_ref()).map(|p| serde_json::to_value(p).unwrap_or_default())}))
-    })?;
-    Ok(r)
+    })
 }
 
 /// Character style from command JSON (friendly names accepted).
@@ -775,7 +1236,6 @@ fn set_char_style(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let tl = s.playhead();
     let (start, end) = (u64_p(p, "start").map(|v| v as usize), u64_p(p, "end").map(|v| v as usize));
-    // A pointer gesture shares one undo step only within the same clip, layer and range.
     let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("graphics.setCharStyle:{}:{ei}:{start:?}:{end:?}", clip.0));
     if bool_p(p, "begin").unwrap_or(false) {
         s.history.merge_key = None;
@@ -807,7 +1267,6 @@ fn set_char_style(s: &mut Session, p: &Value) -> Result<Value> {
 // Upgrade Caption to Graphic / Upgrade to Source Graphic
 // ------------------------------------------------------------------------------------------------
 
-/// Caption text with `<i>`/`<b>`/`<u>` → plain text and character style runs.
 fn caption_runs(text: &str) -> (String, Vec<filmcraft_project::StyleRun>) {
     let mut out = String::new();
     let mut runs: Vec<filmcraft_project::StyleRun> = Vec::new();
@@ -954,8 +1413,7 @@ fn upgrade_to_source(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"clip": clip.0, "item": item.0}))
 }
 
-/// After a `graphics.*` command: copy an edited instance of a source graphic to the shared
-/// layers and every other instance (in the same undo step).
+/// Synchronize edited source graphic instances.
 pub fn sync_source_graphics(s: &mut Session) {
     if s.project.source_graphics.is_empty() {
         return;
@@ -965,7 +1423,6 @@ pub fn sync_source_graphics(s: &mut Session) {
     for item in items {
         let master = p.source_graphics[&item].clone();
         let layers_of = |t: &TrackItem| t.effects.iter().filter(|e| graphic::is_layer(e)).cloned().collect::<Vec<_>>();
-        // the first instance that differs from the master is the edited one
         let mut changed: Option<SourceGraphic> = None;
         for q in p.sequences() {
             if let ItemKind::Sequence(sq) = &q.kind {
@@ -1008,7 +1465,6 @@ pub fn sync_source_graphics(s: &mut Session) {
 // Fonts
 // ------------------------------------------------------------------------------------------------
 
-/// Every graphic layer (all sequences and source graphics), mutably.
 fn for_each_layer(p: &mut Project, mut f: impl FnMut(&mut EffectInstance)) {
     let ids: Vec<ItemId> = p.sequences().map(|q| q.id).collect();
     for id in ids {
@@ -1032,7 +1488,6 @@ fn text_of(e: &EffectInstance, k: &str) -> String {
     }
 }
 
-/// Fonts used by graphics (layers and character styles) and caption tracks.
 pub fn fonts_used(s: &Session) -> Vec<(String, String, usize)> {
     let mut v: Vec<(String, String, usize)> = Vec::new();
     let mut add = |fam: String, st: String| match v.iter_mut().find(|x| x.0.eq_ignore_ascii_case(&fam) && x.1.eq_ignore_ascii_case(&st)) {
@@ -1144,7 +1599,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.template.apply",
             "Apply Graphics Template",
             &[],
-            r#"{"template":id|name|path,"values":{control id or name: value}?,"time":ticks?,"track":index?}"#,
+            r#"{"template":id|name|path,"values":{control id or name: value}? ,"time":ticks? ,"track":index?}"#,
             has_seq,
             apply_template,
         ),
@@ -1152,7 +1607,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.template.export",
             "Export As Motion Graphics Template…",
             G,
-            r#"{"clip":id?,"name":str,"category":str="My Templates","description":str?,"controls":[{"layer":n|name,"param":"text|fill_color|size|font|position|enabled|…","name":str?,"kind":"text|color|slider|checkbox|font|position"?,"min":f64?,"max":f64?,"id":str?}]? (default: each text layer's text),"path":str? (default: the user templates folder),"embedFonts":bool=false,"fontLicense":str?}"#,
+            r#"{"clip":id? ,"name":str,"category":str="My Templates","description":str? ,"controls":[{"layer":n|name,"param":"text|fill_color|size|font|position|enabled|…","name":str? ,"kind":"text|color|slider|checkbox|font|position"? ,"min":f64? ,"max":f64? ,"id":str?}]? (default: each text layer's text),"path":str? (default: the user templates folder),"embedFonts":bool=false,"fontLicense":str?}"#,
             has_graphic,
             export_template,
         ),
@@ -1161,16 +1616,25 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.template.install",
             "Install Motion Graphics Template…",
             G,
-            r#"{"path":str (a .fcgt file; Adobe .mogrt files are refused)}"#,
+            r#"{"path":str (a .fcgt file or convertible .mogrt package)}"#,
             always,
             install_template,
+        ),
+        query("graphics.template.inspectMogrt", "Inspect MOGRT Compatibility", r#"{"path":str (a .mogrt file)}"#, inspect_mogrt),
+        spec(
+            "graphics.template.convertMogrt",
+            "Convert MOGRT to FCGT…",
+            G,
+            r#"{"path":str (a .mogrt file),"outputPath":str (a .fcgt file)}"#,
+            always,
+            convert_mogrt,
         ),
         spec("graphics.template.remove", "Remove Graphics Template", &[], r#"{"template":id|name (a user template)}"#, always, remove_template),
         spec(
             "graphics.template.set",
             "Set Template Property",
             &[],
-            r#"{"clip":id?,"control":id|name,"value":any} or {"clip":id?,"values":{control: value}}"#,
+            r#"{"clip":id? ,"control":id|name,"value":any} or {"clip":id? ,"values":{control: value}}"#,
             has_graphic,
             |s, p| {
                 let clip = target_clip(s, p).ok_or_else(|| bad("graphics.template.set", "no graphic clip"))?;
@@ -1198,7 +1662,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.setRoll",
             "Roll/Crawl Options",
             &[],
-            r#"{"clip":id?,"mode":"off|roll|crawlLeft|crawlRight"?,"startOffScreen":bool?,"endOffScreen":bool?,"prerollFrames":n?,"easeInFrames":n?,"easeOutFrames":n?,"postrollFrames":n? (or …Seconds, or ticks as preroll/easeIn/easeOut/postroll)}"#,
+            r#"{"clip":id? ,"mode":"off|roll|crawlLeft|crawlRight"? ,"startOffScreen":bool? ,"endOffScreen":bool? ,"prerollFrames":n? ,"easeInFrames":n? ,"easeOutFrames":n? ,"postrollFrames":n? (or …Seconds, or ticks as preroll/easeIn/easeOut/postroll)}"#,
             has_graphic,
             set_roll,
         ),
@@ -1206,7 +1670,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.setResponsiveTime",
             "Responsive Design - Time",
             &[],
-            r#"{"clip":id?,"introFrames":n?,"outroFrames":n? (or introSeconds / outroSeconds, or ticks as intro / outro)}"#,
+            r#"{"clip":id? ,"introFrames":n? ,"outroFrames":n? (or introSeconds / outroSeconds, or ticks as intro / outro)}"#,
             has_graphic,
             set_responsive_time,
         ),
@@ -1214,7 +1678,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.pin",
             "Responsive Design - Position",
             &[],
-            r#"{"clip":id?,"layer":n|name?,"to":"frame"|"none"|layer index|layer name,"edges":["left","top","right","bottom"]|"all"="all"}"#,
+            r#"{"clip":id? ,"layer":n|name? ,"to":"frame"|"none"|layer index|layer name,"edges":["left","top","right","bottom"]|"all"="all"}"#,
             has_graphic,
             pin_layer,
         ),
@@ -1222,7 +1686,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.setCharStyle",
             "Character Style",
             &[],
-            r##"{"clip":id?,"layer":n|name?,"start":char=0,"end":char=len,"style":{"font":str,"fontStyle":str,"size":px,"color":"#rrggbb","bold":bool,"italic":bool,"underline":bool,"tracking":n,"baselineShift":px,"caps":"normal|all caps|small caps"},"clear":bool? (remove styles from the range),"merge":bool?,"begin":bool? (start a new undo gesture)}"##,
+            r##"{"clip":id? ,"layer":n|name? ,"start":char=0,"end":char=len,"style":{"font":str,"fontStyle":str,"size":px,"color":"#rrggbb","bold":bool,"italic":bool,"underline":bool,"tracking":n,"baselineShift":px,"caps":"normal|all caps|small caps"},"clear":bool? ,"merge":bool? ,"begin":bool?}"##,
             has_graphic,
             set_char_style,
         ),
@@ -1230,7 +1694,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.upgradeCaption",
             "Upgrade Caption to Graphic",
             G,
-            r#"{"captions":[id]? (default: the selected captions, else the one under the playhead)}"#,
+            r#"{"captions":[id]? (default: selected captions, else the one under the playhead)}"#,
             has_captions,
             upgrade_caption,
         ),

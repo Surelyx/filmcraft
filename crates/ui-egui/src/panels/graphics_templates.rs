@@ -438,6 +438,31 @@ pub fn template_controls(
                 );
                 autos.push((id, r.response.rect, c.name.clone()));
             }
+            ControlKind::Choice => {
+                let current = c.choice_layers.iter().position(|group| {
+                    group.iter().all(|uid| {
+                        it.effects.iter()
+                            .find(|layer| filmcraft_project::gtemplate::layer_uid(layer) == *uid)
+                            .is_some_and(|layer| layer.enabled)
+                    })
+                }).unwrap_or(0);
+
+                let mut selected = current;
+                let label = c.choices.get(current).map(String::as_str).unwrap_or("Select…");
+                let r = egui::ComboBox::from_id_salt(("gfx-tpl-choice", clip.0, c.id.as_str()))
+                    .selected_text(label)
+                    .width(170.0)
+                    .show_ui(&mut vui, |ui| {
+                        for (index, choice) in c.choices.iter().enumerate() {
+                            ui.selectable_value(&mut selected, index, choice);
+                        }
+                    });
+
+                autos.push((id, r.response.rect, c.name.clone()));
+                if selected != current && selected < c.choices.len() {
+                    set(json!(selected), actions);
+                }
+            }
             ControlKind::Position => {
                 let v = pv.and_then(|v| v.as_vec2()).unwrap_or_default();
                 let (mut x, mut y) = (v.x, v.y);
@@ -592,11 +617,11 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
     match id {
         "graphics.template.install" if params.get("path").is_none() => {
             let (id, ctx) = (id.to_string(), ctx.clone());
-            Some(app.pick(FileDialog::open_file(tl!("FilmCraft Graphics Template"), &["fcgt"]), move |app, paths| {
+            Some(app.pick(FileDialog::open_files(&["fcgt", "mogrt"]), move |app, paths| {
                 let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
                 let r = app.session.execute(&id, json!({"path": path})).map_err(|e| e.to_string());
                 // The Browse panel's Install… button calls this directly and drops the result
-                // (#611); report a refused file here, so every caller shows why nothing happened.
+                // (#611); report a refusd file here, so every caller shows why nothing happened.
                 if let Err(e) = &r {
                     app.ui.status = e.clone();
                 }

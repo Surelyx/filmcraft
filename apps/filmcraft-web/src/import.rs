@@ -158,6 +158,49 @@ pub fn take_files(files: Vec<web_sys::File>) {
 /// Files a picker returned: imported, or with a relink hint, the first one is registered under
 /// `/files/<name>` and the hint's command runs on it (#111).
 fn picked(files: Vec<web_sys::File>, relink: Option<RelinkHint>) {
+    if relink.is_none() && files.iter().any(|f| {
+        let n = f.name().to_ascii_lowercase();
+        n.ends_with(".mogrt") || n.ends_with(".fcgt")
+    }) {
+        wasm_bindgen_futures::spawn_local(async move {
+            for f in files {
+                let lower = f.name().to_ascii_lowercase();
+                if !lower.ends_with(".mogrt") && !lower.ends_with(".fcgt") { continue; }
+                let name = f.name();
+                let bytes = match JsFuture::from(f.array_buffer()).await {
+                    Ok(buf) => js_sys::Uint8Array::new(&buf).to_vec(),
+                    Err(e) => {
+                        crate::post(move |w, _| w.app.status(format!("Could not read MOGRT: {e:?}")));
+                        continue;
+                    }
+                };
+                let path = format!("/projects/{name}");
+                web_sys::console::log_1(
+                    &format!("MOGRT import: read {} bytes from {}", bytes.len(), name).into()
+                );
+                fs::put(&path, bytes);
+                let outcome = on_ui(move |w, _| {
+                    w.app.session.execute("graphics.template.install", json!({"path": path}))
+                        .map_err(|e| e.to_string())
+                }).await;
+                match outcome {
+                    Ok(v) => {
+                        let msg = format!(
+                            "Installed MOGRT: {}",
+                            v.get("name").and_then(Value::as_str).unwrap_or("template")
+                        );
+                        web_sys::console::log_1(&msg.clone().into());
+                        crate::post(move |w, _| w.app.status(msg));
+                    }
+                    Err(e) => {
+                        web_sys::console::error_1(&format!("MOGRT install failed: {e}").into());
+                        crate::post(move |w, _| w.app.status(format!("MOGRT install failed: {e}")));
+                    }
+                }
+            }
+        });
+        return;
+    }
     let Some(hint) = relink else { return take_files(files) };
     let Some(f) = files.into_iter().next() else { return };
     wasm_bindgen_futures::spawn_local(async move {
@@ -192,43 +235,51 @@ pub fn pick(exts: &[&str], multiple: bool) {
 
 /// [`pick`], handing the files to [`picked`]: a cancelled picker leaves nothing pending.
 fn pick_then(exts: &[&str], multiple: bool, relink: Option<RelinkHint>) {
-    let accept: Vec<String> = exts.iter().map(|e| format!(".{e}")).collect();
-    if has_fsa_picker() {
-        let opts = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&opts, &"multiple".into(), &multiple.into());
-        wasm_bindgen_futures::spawn_local(async move {
-            let Some(w) = web_sys::window() else { return };
-            let Ok(f) = js_sys::Reflect::get(&w, &"showOpenFilePicker".into()).and_then(|f| f.dyn_into::<js_sys::Function>()) else { return };
-            let Ok(p) = f.call1(&w, &opts).and_then(|p| p.dyn_into::<js_sys::Promise>()) else { return };
-            // rejected when the user cancels
-            let Ok(handles) = JsFuture::from(p).await else { return };
-            let mut files = Vec::new();
-            for h in js_sys::Array::from(&handles).iter() {
-                if let Ok(h) = h.dyn_into::<web_sys::FileSystemFileHandle>()
-                    && let Ok(f) = JsFuture::from(h.get_file()).await
-                    && let Ok(f) = f.dyn_into::<web_sys::File>()
-                {
-                    files.push(f);
-                }
-            }
-            picked(files, relink);
-        });
+    let accept = exts
+        .iter()
+        .map(|e| format!(".{}", e.trim_start_matches('.')))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
-    }
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else { return };
-    let Ok(input) = doc.create_element("input").and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().map_err(Into::into)) else { return };
+    };
+
+    let Ok(input) = doc
+        .create_element("input")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().map_err(Into::into))
+    else {
+        return;
+    };
+
     input.set_type("file");
     input.set_multiple(multiple);
-    input.set_accept(&accept.join(","));
+    input.set_accept(&accept);
+
     let inp = input.clone();
     let on_change = Closure::<dyn FnMut()>::new(move || {
         if let Some(list) = inp.files() {
-            picked((0..list.length()).filter_map(|i| list.get(i)).collect(), relink.clone());
+            let files: Vec<web_sys::File> =
+                (0..list.length()).filter_map(|i| list.get(i)).collect();
+
+            if !files.is_empty() {
+                picked(files, relink.clone());
+            }
         }
+        inp.set_onchange(None);
+        inp.remove();
     });
+
     input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
     on_change.forget();
-    input.click();
+
+    let Some(body) = doc.body() else {
+        return;
+    };
+
+    if body.append_child(&input).is_ok() {
+        input.click();
+    }
 }
 
 /// Drop files anywhere on the page to import them (or open a project).

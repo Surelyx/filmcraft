@@ -25,12 +25,14 @@
 //!   layer of a template has one.
 //! - `controls` are the properties a user of the template edits (Essential Graphics ▸ Edit):
 //!   text, colour, slider (with `min` / `max`), checkbox, font and position, each bound to one
-//!   layer parameter (`enabled` = the layer's visibility).
+//!   layer parameter (`enabled` = the layer's visibility). Choice controls select one exclusive
+//!   group of layers through `choices` and the parallel `choice_layers` list.
 //! - `resources.fonts` optionally embeds font files (base64) that the template needs; installing
 //!   the template registers them. Only embed fonts whose licence allows redistribution.
 //!
-//! FilmCraft never reads Adobe `.mogrt` files (or any other application's template format);
-//! [`GraphicsTemplate::from_bytes`] rejects ZIP archives with a message saying so.
+//! [`GraphicsTemplate::from_bytes`] reads only FilmCraft JSON and rejects ZIP archives. The
+//! separate [`crate::mogrt`] module safely inspects packages and converts only supported static
+//! source structures.
 //!
 //! The built-in templates ([`builtin_templates`]) are original designs made for FilmCraft in code
 //! (no image, font or template files), under the project licence.
@@ -59,11 +61,12 @@ pub enum ControlKind {
     Checkbox,
     Font,
     Position,
+    Choice,
 }
 
 impl ControlKind {
-    pub const ALL: [ControlKind; 6] =
-        [ControlKind::Text, ControlKind::Color, ControlKind::Slider, ControlKind::Checkbox, ControlKind::Font, ControlKind::Position];
+    pub const ALL: [ControlKind; 7] =
+        [ControlKind::Text, ControlKind::Color, ControlKind::Slider, ControlKind::Checkbox, ControlKind::Font, ControlKind::Position, ControlKind::Choice];
     pub fn name(self) -> &'static str {
         match self {
             ControlKind::Text => "text",
@@ -72,6 +75,7 @@ impl ControlKind {
             ControlKind::Checkbox => "checkbox",
             ControlKind::Font => "font",
             ControlKind::Position => "position",
+            ControlKind::Choice => "choice",
         }
     }
     pub fn from_name(s: &str) -> Option<ControlKind> {
@@ -121,6 +125,12 @@ pub struct TemplateControl {
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+    /// Choice labels, parallel to `choice_layers` for a choice control.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// Mutually exclusive layer groups, one per choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choice_layers: Vec<Vec<u64>>,
 }
 
 /// The template a placed graphic came from (kept on the clip, `GraphicMeta::template`).
@@ -278,16 +288,15 @@ impl GraphicsTemplate {
         if self.canvas[0] == 0 || self.canvas[1] == 0 || self.canvas[0] > 16384 || self.canvas[1] > 16384 {
             return bad(format!("bad canvas size {:?}", self.canvas));
         }
-        let mut uids = Vec::new();
+        let mut uids = std::collections::HashSet::new();
         for (i, l) in self.layers.iter().enumerate() {
             if !graphic::is_layer(l) {
                 return bad(format!("layer {i} is `{}`, not a graphic layer", l.effect));
             }
             let uid = layer_uid(l);
-            if uid == 0 || uids.contains(&uid) {
+            if uid == 0 || !uids.insert(uid) {
                 return bad(format!("layer {i} has no unique uid"));
             }
-            uids.push(uid);
         }
         let mut ids = Vec::new();
         for c in &self.controls {
@@ -300,6 +309,33 @@ impl GraphicsTemplate {
             };
             if c.param != "enabled" && !l.params.contains_key(&c.param) {
                 return bad(format!("control `{}`: the layer has no parameter `{}`", c.name, c.param));
+            }
+            if c.kind == ControlKind::Choice {
+                if c.param != "enabled" {
+                    return bad(format!("choice control `{}` must edit layer visibility", c.name));
+                }
+                if c.choices.is_empty()
+                    || c.choices.len() != c.choice_layers.len()
+                    || c.choices.iter().any(|choice| choice.trim().is_empty())
+                    || c.choices.iter().collect::<std::collections::HashSet<_>>().len() != c.choices.len()
+                    || c.choice_layers.iter().any(Vec::is_empty)
+                {
+                    return bad(format!("choice control `{}` has mismatched choices and layer groups", c.name));
+                }
+                let mut grouped_uids = std::collections::HashSet::new();
+                for uid in c.choice_layers.iter().flatten() {
+                    if !uids.contains(uid) {
+                        return bad(format!("choice control `{}` points at missing layer {uid}", c.name));
+                    }
+                    if !grouped_uids.insert(*uid) {
+                        return bad(format!("choice control `{}` has overlapping layer groups", c.name));
+                    }
+                }
+                if !grouped_uids.contains(&c.layer) {
+                    return bad(format!("choice control `{}` primary layer is not in its layer groups", c.name));
+                }
+            } else if !c.choices.is_empty() || !c.choice_layers.is_empty() {
+                return bad(format!("non-choice control `{}` has choice metadata", c.name));
             }
         }
         for f in &self.resources.fonts {
@@ -438,7 +474,17 @@ fn pin(e: &mut EffectInstance, to: u64, edges: [bool; 4], offsets: [f64; 4]) {
 }
 
 fn ctl(id: &str, name: &str, layer: u64, param: &str) -> TemplateControl {
-    TemplateControl { id: id.into(), name: name.into(), kind: ControlKind::for_param(param), layer, param: param.into(), min: None, max: None }
+    TemplateControl {
+        id: id.into(),
+        name: name.into(),
+        kind: ControlKind::for_param(param),
+        layer,
+        param: param.into(),
+        min: None,
+        max: None,
+        choices: Vec::new(),
+        choice_layers: Vec::new(),
+    }
 }
 
 fn slider(id: &str, name: &str, layer: u64, param: &str, min: f64, max: f64) -> TemplateControl {
@@ -742,6 +788,31 @@ mod tests {
         let mut t = builtin_templates().remove(0);
         t.controls[0].layer = 999;
         assert!(matches!(t.validate(), Err(TemplateError::Invalid(_))));
+    }
+
+    #[test]
+    fn choice_control_layers_are_valid_and_exclusive() {
+        let mut template = builtin_templates().remove(0);
+        let first_uid = layer_uid(&template.layers[0]);
+        let second_uid = template.layers.iter().map(layer_uid).max().unwrap_or(0).saturating_add(1);
+        let mut second = template.layers[0].clone();
+        second.layer.get_or_insert_with(Default::default).uid = second_uid;
+        template.layers.push(second);
+        let choice_index = template.controls.len();
+        template.controls.push(TemplateControl {
+            id: "choice".into(),
+            name: "Choice".into(),
+            kind: ControlKind::Choice,
+            layer: first_uid,
+            param: "enabled".into(),
+            min: None,
+            max: None,
+            choices: vec!["First".into(), "Second".into()],
+            choice_layers: vec![vec![first_uid], vec![second_uid]],
+        });
+        assert!(template.validate().is_ok());
+        template.controls[choice_index].choice_layers[1].push(first_uid);
+        assert!(matches!(template.validate(), Err(TemplateError::Invalid(_))));
     }
 
     #[test]

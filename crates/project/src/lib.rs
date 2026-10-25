@@ -19,6 +19,7 @@ pub mod gtemplate;
 pub mod keyframe;
 pub mod mask;
 pub mod mixer;
+pub mod mogrt;
 pub mod multicam;
 pub mod narration;
 pub mod transcript;

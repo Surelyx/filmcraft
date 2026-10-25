@@ -17,6 +17,8 @@ filmcraft-media = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+roxmltree = { workspace = true }
+zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -1,4 +1,7 @@
+use std::io::Write;
+
 use serde_json::{Value, json};
+use zip::write::SimpleFileOptions;
 
 use crate::Session;
 use crate::media_test_util::tmp_dir;
@@ -38,6 +41,16 @@ fn texts(s: &Session, clip: ClipId) -> Vec<String> {
 
 fn clip_of(v: &Value) -> ClipId {
     ClipId(v["clip"].as_u64().unwrap())
+}
+
+fn mogrt_package(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    for (name, data) in entries {
+        writer.start_file(*name, SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)).unwrap();
+        writer.write_all(data).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
 }
 
 #[test]
@@ -110,18 +123,95 @@ fn template_export_install_apply_round_trip() {
 }
 
 #[test]
-fn mogrt_files_are_never_read() {
+fn mogrt_inspect_convert_and_install() {
     let mut s = demo("gt-mogrt");
     let d = tmp_dir("gt-mogrt-files");
     let m = d.join("fancy.mogrt");
-    std::fs::write(&m, b"PK\x03\x04whatever").unwrap();
-    let e = s.execute("graphics.template.install", json!({"path": m.to_string_lossy()})).unwrap_err().to_string();
-    assert!(e.contains(".mogrt"), "{e}");
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><text x="12" y="40" font-size="24">Editable title</text></svg>"#;
+    std::fs::write(&m, mogrt_package(&[("manifest.json", br#"{"name":"Imported title"}"#), ("project.svg", svg)])).unwrap();
+    let report = s.execute("graphics.template.inspectMogrt", json!({"path": m.to_string_lossy()})).unwrap();
+    assert_eq!(report["name"], "Imported title");
+    assert_eq!(report["convertible"], true);
+    assert!(report["supported_features"].as_array().unwrap().iter().any(|f| f == "static SVG text"));
+    let installed = s.execute("graphics.template.install", json!({"path": m.to_string_lossy()})).unwrap();
+    assert!(installed["path"].as_str().unwrap().ends_with("imported-title.fcgt"));
+    assert_eq!(installed["compatibility"]["convertible"], true);
+    assert_eq!(s.execute("graphics.template.list", json!({"source": "user"})).unwrap().as_array().unwrap().len(), 1);
+
+    let output = d.join("converted.fcgt");
+    let conversion = s.execute("graphics.template.convertMogrt", json!({"path": m.to_string_lossy(), "outputPath": output.to_string_lossy()})).unwrap();
+    assert_eq!(conversion["format"], "filmcraft.graphicsTemplate");
+    assert_eq!(conversion["partial"], false);
+    let generated = std::fs::read(output).unwrap();
+    let generated = filmcraft_project::gtemplate::GraphicsTemplate::from_bytes(&generated).unwrap();
+    assert_eq!(generated.layers.len(), 1);
+    assert_eq!(generated.controls.len(), 1);
+
+    let malformed = d.join("bad.mogrt");
+    std::fs::write(&malformed, b"PK\x03\x04whatever").unwrap();
+    let error = s.execute("graphics.template.inspectMogrt", json!({"path": malformed.to_string_lossy()})).unwrap_err().to_string();
+    assert!(error.contains("invalid MOGRT ZIP package"), "{error}");
+
     // a ZIP renamed to .fcgt is refused too
     let z = d.join("renamed.fcgt");
     std::fs::write(&z, b"PK\x03\x04whatever").unwrap();
     let e = s.execute("graphics.template.install", json!({"path": z.to_string_lossy()})).unwrap_err().to_string();
-    assert!(e.contains("does not read"), "{e}");
+    assert!(e.contains("ZIP archive"), "{e}");
+}
+
+#[test]
+#[ignore = "requires the local test_templates/Color Arrives System.mogrt fixture"]
+fn color_arrives_mogrt_installs_all_butterfly_variants_and_selector() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = repo.join("test_templates/Color Arrives System.mogrt");
+    let mut s = demo("gt-color-arrives");
+    let installed = s.execute("graphics.template.install", json!({"path": source.to_string_lossy()})).unwrap();
+    assert_eq!(installed["compatibility"]["partial"], true, "the opaque native AEP is not fully converted");
+    let supported = installed["compatibility"]["supported_features"].as_array().unwrap();
+    assert!(supported.iter().any(|feature| feature == "6 butterfly Illustrator assets extracted from the nested project archive"));
+    assert!(supported.iter().any(|feature| feature == "all 6 butterfly color variants imported and linked to a six-way selector"));
+    let unsupported = installed["compatibility"]["unsupported_features"].as_array().unwrap();
+    assert!(unsupported.iter().any(|feature| {
+        feature.as_str().is_some_and(|feature| feature.contains("native AEP artwork, layer geometry, placement, and keyframes were not decoded"))
+    }));
+    assert!(unsupported.iter().any(|feature| feature.as_str().is_some_and(|feature| feature.contains("not decoded After Effects transforms"))));
+    assert!(
+        unsupported.iter().any(|feature| feature.as_str().is_some_and(|feature| feature.contains("embedded raster footage was inventoried but not placed")))
+    );
+
+    let installed_path = installed["path"].as_str().unwrap();
+    let template_bytes = std::fs::read(installed_path).unwrap();
+    let template = filmcraft_project::gtemplate::GraphicsTemplate::from_bytes(&template_bytes).unwrap();
+    assert_eq!(template.canvas, [1920, 1080]);
+    let selector = template.controls.iter().find(|control| control.id == "mogrt-butterfly-selector").unwrap();
+    assert_eq!(selector.choices, ["Butterfly Violet", "Butterfly Blue", "Butterfly Gold", "Butterfly Green", "Butterfly Red", "Butterfly Orange"]);
+    assert_eq!(selector.choice_layers.len(), 6);
+    assert!(selector.choice_layers.iter().all(|group| !group.is_empty()));
+    let selected = selector.choices.iter().position(|choice| choice == "Butterfly Violet").unwrap();
+    for (index, group) in selector.choice_layers.iter().enumerate() {
+        for uid in group {
+            let layer = template.layers.iter().find(|layer| filmcraft_project::gtemplate::layer_uid(layer) == *uid).unwrap();
+            assert_eq!(layer.enabled, index == selected, "initial selector visibility for {}", selector.choices[index]);
+        }
+    }
+
+    let applied = s.execute("graphics.template.apply", json!({"template": installed["id"]})).unwrap();
+    let clip = clip_of(&applied);
+    let controls = s.execute("graphics.template.controls", json!({"clip": clip.0})).unwrap();
+    assert_eq!(
+        controls["controls"].as_array().unwrap().iter().find(|control| control["id"] == "mogrt-butterfly-selector").unwrap()["value"],
+        "Butterfly Violet"
+    );
+    s.execute("graphics.template.set", json!({"clip": clip.0, "control": "mogrt-butterfly-selector", "value": "Butterfly Blue"})).unwrap();
+    let controls = s.execute("graphics.template.controls", json!({"clip": clip.0})).unwrap();
+    assert_eq!(controls["controls"].as_array().unwrap().iter().find(|control| control["id"] == "mogrt-butterfly-selector").unwrap()["value"], "Butterfly Blue");
+    let placed = item(&s, clip);
+    for (index, group) in selector.choice_layers.iter().enumerate() {
+        for uid in group {
+            let layer = placed.effects.iter().find(|layer| filmcraft_project::gtemplate::layer_uid(layer) == *uid).unwrap();
+            assert_eq!(layer.enabled, index == 1, "updated selector visibility for {}", selector.choices[index]);
+        }
+    }
 }
 
 #[test]
